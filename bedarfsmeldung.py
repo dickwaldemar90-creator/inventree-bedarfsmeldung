@@ -15,16 +15,17 @@ from docx import Document
 from docx.shared import Cm, Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.platypus import (
     SimpleDocTemplate,
     Table,
     TableStyle,
     Paragraph,
-    Spacer,
 )
 
 
@@ -35,7 +36,7 @@ class BedarfsmeldungPlugin(
     SLUG = "bedarfsmeldung"
     TITLE = "Automatische Bedarfsmeldung"
     DESCRIPTION = "Bedarfsmeldungen mit Word und PDF"
-    VERSION = "1.2.0"
+    VERSION = "1.3.0"
 
     SCHEDULED_TASKS = {
         "bestandspruefung": {
@@ -109,6 +110,7 @@ class BedarfsmeldungPlugin(
     def money(self, value):
         if value is None:
             return "Zu prüfen"
+
         return (
             f"{value:,.2f}"
             .replace(",", "_")
@@ -123,6 +125,25 @@ class BedarfsmeldungPlugin(
             "true", "1", "yes", "on"
         )
 
+    def short_reason(self, data):
+        return (
+            "Mindestbestand unterschritten.\n"
+            f"Lagerbestand: {data['stock']} Stück\n"
+            f"Maximalbestand: {data['maximum']} Stück"
+        )
+
+    def reason(self, data):
+        return (
+            "Mindestbestand unterschritten.\n"
+            f"Lagerbestand: {data['stock']} Stück\n"
+            f"Mindestbestand: {data['minimum']} Stück\n"
+            f"Maximalbestand: {data['maximum']} Stück\n"
+            f"Offene Bestellungen: {data['ordered']} Stück\n"
+            f"Berücksichtigt: {data['considered']} Stück\n"
+            f"Rechnerischer Bedarf: {data['demand']} Stück\n"
+            f"Bestellmenge: {data['quantity']} Stück"
+        )
+
     def header_rows(self, data):
         return [
             ["Firma:", data["company"]],
@@ -134,10 +155,14 @@ class BedarfsmeldungPlugin(
             ["Kunde:", ""],
             ["Einsatzort:", ""],
             ["Termin:", ""],
+            [
+                "Ausführliche Begründung:",
+                self.short_reason(data),
+            ],
         ]
 
     def article_rows(self, data):
-        rows = [
+        return [
             [
                 "Menge",
                 "Bezeichnung/ArtNr.",
@@ -152,35 +177,35 @@ class BedarfsmeldungPlugin(
                 data["unit_price"],
                 data["total_price"],
             ],
+            [
+                "Gesamtsumme:",
+                "",
+                "",
+                "",
+                data["total_price"],
+            ],
         ]
-
-        for _ in range(4):
-            rows.append(["", "", "", "", ""])
-
-        rows.append([
-            "", "Gesamtsumme:", "", "",
-            data["total_price"]
-        ])
-
-        return rows
-
-    def reason(self, data):
-        return (
-            "Mindestbestand unterschritten.\n"
-            f"Lagerbestand: {data['stock']} Stück\n"
-            f"Mindestbestand: {data['minimum']} Stück\n"
-            f"Maximalbestand: {data['maximum']} Stück\n"
-            f"Offene Bestellungen: {data['ordered']} Stück\n"
-            f"Berücksichtigt: {data['considered']} Stück\n"
-            f"Rechnerischer Bedarf: {data['demand']} Stück\n"
-            f"Bestellmenge: {data['quantity']} Stück"
-        )
 
     def shade(self, cell):
         properties = cell._tc.get_or_add_tcPr()
         shading = OxmlElement("w:shd")
-        shading.set(qn("w:fill"), "D9D9D9")
+        shading.set(qn("w:fill"), "BFBFBF")
         properties.append(shading)
+
+    def format_cell(self, cell, centered=False):
+        cell.vertical_alignment = (
+            WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        )
+
+        for paragraph in cell.paragraphs:
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.space_before = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1.0
+
+            if centered:
+                paragraph.alignment = (
+                    WD_ALIGN_PARAGRAPH.CENTER
+                )
 
     def word_table(self, document, rows, widths):
         table = document.add_table(
@@ -199,10 +224,7 @@ class BedarfsmeldungPlugin(
                 cell = table.cell(r, c)
                 cell.width = Cm(widths[c])
                 cell.text = str(value)
-
-                for paragraph in cell.paragraphs:
-                    paragraph.paragraph_format.space_after = Pt(3)
-                    paragraph.paragraph_format.space_before = Pt(3)
+                self.format_cell(cell)
 
         return table
 
@@ -220,6 +242,9 @@ class BedarfsmeldungPlugin(
         normal = document.styles["Normal"]
         normal.font.name = "Arial"
         normal.font.size = Pt(10)
+        normal.paragraph_format.space_after = Pt(0)
+        normal.paragraph_format.space_before = Pt(0)
+        normal.paragraph_format.line_spacing = 1.0
 
         header = self.word_table(
             document,
@@ -229,65 +254,105 @@ class BedarfsmeldungPlugin(
 
         for row in header.rows:
             self.shade(row.cells[0])
+            self.format_cell(
+                row.cells[0],
+                centered=True,
+            )
 
-        document.add_paragraph()
-
-        reason = self.word_table(
-            document,
-            [
-                ["Ausführliche Begründung:"],
-                [self.reason(data)],
-            ],
-            [18],
-        )
-
-        self.shade(reason.cell(0, 0))
-
-        document.add_paragraph()
-
+        # Artikeltabelle ohne Leerabsatz
         articles = self.word_table(
             document,
             self.article_rows(data),
-            [1.5, 7, 4, 2.75, 2.75],
+            [2, 7.5, 3.5, 2.5, 2.5],
         )
 
         for cell in articles.rows[0].cells:
             self.shade(cell)
+            self.format_cell(cell, centered=True)
+
+        for index in (0, 2, 3, 4):
+            self.format_cell(
+                articles.cell(1, index),
+                centered=True,
+            )
 
         last = articles.rows[-1]
-        last.cells[0].merge(last.cells[3])
-        last.cells[0].text = "Gesamtsumme:"
-        self.shade(last.cells[0])
+        merged = last.cells[0].merge(last.cells[3])
+        merged.text = "Gesamtsumme:"
+
+        self.format_cell(merged, centered=True)
+        self.format_cell(
+            last.cells[4],
+            centered=True,
+        )
 
         output = BytesIO()
         document.save(output)
         return output.getvalue()
 
-    def pdf_table(self, rows, widths):
-        styles = getSampleStyleSheet()
-        style = styles["Normal"]
-        style.fontName = "Helvetica"
-        style.fontSize = 9
-        style.leading = 12
+    def pdf_table(self, rows, widths, centered=None):
+        centered = centered or set()
+
+        normal = ParagraphStyle(
+            "NormalCell",
+            fontName="Helvetica",
+            fontSize=9,
+            leading=11,
+            spaceBefore=0,
+            spaceAfter=0,
+        )
+
+        center = ParagraphStyle(
+            "CenteredCell",
+            parent=normal,
+            alignment=1,
+        )
 
         converted = []
 
-        for row in rows:
-            converted.append([
-                Paragraph(
-                    escape(str(value)).replace("\n", "<br/>"),
-                    style,
-                )
-                for value in row
-            ])
+        for r, row in enumerate(rows):
+            converted_row = []
 
-        table = Table(converted, colWidths=widths)
+            for c, value in enumerate(row):
+                style = (
+                    center
+                    if (r, c) in centered
+                    else normal
+                )
+
+                converted_row.append(
+                    Paragraph(
+                        escape(str(value)).replace(
+                            "\n", "<br/>"
+                        ),
+                        style,
+                    )
+                )
+
+            converted.append(converted_row)
+
+        table = Table(
+            converted,
+            colWidths=widths,
+            spaceBefore=0,
+            spaceAfter=0,
+        )
 
         table.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), 0.7, colors.black),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            (
+                "GRID",
+                (0, 0), (-1, -1),
+                0.6, colors.black,
+            ),
+            (
+                "VALIGN",
+                (0, 0), (-1, -1),
+                "MIDDLE",
+            ),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ]))
 
         return table
@@ -304,45 +369,50 @@ class BedarfsmeldungPlugin(
             bottomMargin=56,
         )
 
-        gray = colors.HexColor("#D9D9D9")
+        gray = colors.HexColor("#BFBFBF")
+
+        header_rows = self.header_rows(data)
 
         header = self.pdf_table(
-            self.header_rows(data),
+            header_rows,
             [142, 368],
+            centered={
+                (r, 0)
+                for r in range(len(header_rows))
+            },
         )
 
         header.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (0, -1), gray),
         ]))
 
-        reason = self.pdf_table(
-            [
-                ["Ausführliche Begründung:"],
-                [self.reason(data)],
-            ],
-            [510],
-        )
+        centered = {
+            (0, c) for c in range(5)
+        }
 
-        reason.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), gray),
-        ]))
+        centered.update({
+            (1, 0),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 0),
+            (2, 4),
+        })
 
         articles = self.pdf_table(
             self.article_rows(data),
-            [43, 197, 114, 78, 78],
+            [56.67, 212.50, 99.17, 70.83, 70.83],
+            centered=centered,
         )
 
         articles.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), gray),
             ("SPAN", (0, -1), (3, -1)),
-            ("BACKGROUND", (0, -1), (3, -1), gray),
         ]))
 
+        # Keine Leerzeilen oder Abstandshalter
         document.build([
             header,
-            Spacer(1, 18),
-            reason,
-            Spacer(1, 18),
             articles,
         ])
 
