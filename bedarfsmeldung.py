@@ -1,6 +1,5 @@
 
 from decimal import Decimal, ROUND_CEILING
-from io import BytesIO
 from xml.sax.saxutils import escape
 import logging
 
@@ -12,22 +11,6 @@ from plugin import InvenTreePlugin
 from plugin.mixins import SettingsMixin, ScheduleMixin
 from part.models import Part
 
-from docx import Document
-from docx.shared import Cm, Pt
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Table,
-    TableStyle,
-    Paragraph,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +21,10 @@ class BedarfsmeldungPlugin(
     NAME = "Bedarfsmeldung"
     SLUG = "bedarfsmeldung"
     TITLE = "Automatische Bedarfsmeldung"
-    DESCRIPTION = "Bedarfsmeldung direkt als E-Mail-Formular"
-    VERSION = "1.4.0"
+    DESCRIPTION = "Automatische Ersatzteil-Bedarfsüberwachung"
+    VERSION = "2.0.0"
+
+    STATE_KEY = "bedarfsmeldung_v2"
 
     SCHEDULED_TASKS = {
         "bestandspruefung": {
@@ -55,6 +40,23 @@ class BedarfsmeldungPlugin(
             "default": False,
             "validator": bool,
         },
+        "TEST_MODE": {
+            "name": "Testmodus aktivieren",
+            "description": (
+                "An: Nur Testartikel überwachen. "
+                "Aus: Alle aktiven Artikel überwachen."
+            ),
+            "default": True,
+            "validator": bool,
+        },
+        "TEST_PART_ID": {
+            "name": "Testartikel-ID",
+            "description": (
+                "Wird nur im Testmodus verwendet."
+            ),
+            "default": 1,
+            "validator": int,
+        },
         "RECIPIENT": {
             "name": "E-Mail-Empfänger",
             "default": "",
@@ -67,11 +69,6 @@ class BedarfsmeldungPlugin(
             "name": "Antragsteller",
             "default": "",
         },
-        "TEST_PART_ID": {
-            "name": "Testartikel-ID",
-            "default": 1,
-            "validator": int,
-        },
         "ROUNDING": {
             "name": "Bestellmengen-Rundung",
             "default": 10,
@@ -79,37 +76,53 @@ class BedarfsmeldungPlugin(
         },
         "INCLUDE_OPEN_ORDERS": {
             "name": "Offene Bestellungen berücksichtigen",
-            "default": True,
+            "default": False,
             "validator": bool,
         },
         "PREVENT_DUPLICATES": {
-            "name": "Doppelte Bedarfsmeldungen verhindern",
+            "name": "Bereits gemeldeten Bedarf berücksichtigen",
+            "description": (
+                "Verhindert wiederholte Meldungen "
+                "für bereits gemeldete Mengen."
+            ),
             "default": True,
             "validator": bool,
         },
-        "ATTACH_PDF": {
-            "name": "PDF anhängen",
-            "description": "Optionaler PDF-Anhang",
-            "default": False,
-            "validator": bool,
+        "RESET_PART_ID": {
+            "name": "Bedarf zurücksetzen – Artikel-ID",
+            "description": (
+                "Interne ID des Artikels, dessen "
+                "gemeldeter Bedarf zurückgesetzt werden soll."
+            ),
+            "default": 0,
+            "validator": int,
         },
-        "ATTACH_WORD": {
-            "name": "Word-Datei anhängen",
-            "description": "Optionaler Word-Anhang",
-            "default": False,
-            "validator": bool,
+        "RESET_TOKEN": {
+            "name": "Rücksetznummer",
+            "description": (
+                "Für jede Rücksetzung die Nummer erhöhen."
+            ),
+            "default": 0,
+            "validator": int,
         },
     }
+
+    # ==========================================
+    # HILFSFUNKTIONEN
+    # ==========================================
 
     def number(self, value):
         if callable(value):
             value = value()
+
         return Decimal(str(value or 0))
 
     def fmt(self, value):
         result = format(self.number(value), "f")
+
         if "." in result:
             result = result.rstrip("0").rstrip(".")
+
         return result.replace(".", ",")
 
     def money(self, value):
@@ -125,19 +138,31 @@ class BedarfsmeldungPlugin(
         )
 
     def enabled(self, key):
-        value = self.get_setting(key)
-        return str(value).strip().lower() in (
+        return str(
+            self.get_setting(key)
+        ).strip().lower() in (
             "true", "1", "yes", "on"
         )
 
-    def short_reason(self, data):
-        return (
+    def html_value(self, value):
+        if value is None or value == "":
+            return "&nbsp;"
+
+        return escape(str(value)).replace(
+            "\n", "<br>"
+        )
+
+    # ==========================================
+    # FORMULARDATEN
+    # ==========================================
+
+    def header_rows(self, data):
+        reason = (
             "Mindestbestand unterschritten.\n"
             f"Lagerbestand: {data['stock']} Stück\n"
             f"Maximalbestand: {data['maximum']} Stück"
         )
 
-    def header_rows(self, data):
         return [
             ["Firma:", data["company"]],
             ["Antragsteller:", data["applicant"]],
@@ -148,10 +173,7 @@ class BedarfsmeldungPlugin(
             ["Kunde:", ""],
             ["Einsatzort:", ""],
             ["Termin:", ""],
-            [
-                "Ausführliche Begründung:",
-                self.short_reason(data),
-            ],
+            ["Ausführliche Begründung:", reason],
         ]
 
     def article_rows(self, data):
@@ -172,26 +194,11 @@ class BedarfsmeldungPlugin(
                 data["unit_price"],
                 data["total_price"],
             ],
-            [
-                "Gesamtsumme:",
-                "",
-                "",
-                "",
-                data["total_price"],
-            ],
         ]
 
     # ==========================================
     # HTML-FORMULAR DIREKT IN DER E-MAIL
     # ==========================================
-
-    def html_value(self, value):
-        if not value:
-            return "&nbsp;"
-
-        return escape(str(value)).replace(
-            "\n", "<br>"
-        )
 
     def create_html(self, data):
         table_style = (
@@ -244,8 +251,7 @@ class BedarfsmeldungPlugin(
                 + "</td>"
                 f'<td width="71%" style="{white_style}">'
                 + self.html_value(value)
-                + "</td>"
-                "</tr>"
+                + "</td></tr>"
             )
 
         html += "</table>"
@@ -309,278 +315,200 @@ class BedarfsmeldungPlugin(
         return html
 
     # ==========================================
-    # OPTIONALER WORD-ANHANG
+    # LIEFERANT UND STAFFELPREISE
     # ==========================================
 
-    def shade(self, cell):
-        properties = cell._tc.get_or_add_tcPr()
+    def get_supplier_price(self, part, quantity):
+        supplier = "Nicht hinterlegt"
+        unit_price = None
+        total_price = None
 
-        shading = OxmlElement("w:shd")
-        shading.set(qn("w:fill"), "BFBFBF")
+        supplier_part = part.default_supplier
 
-        properties.append(shading)
-
-    def format_cell(self, cell, centered=False):
-        cell.vertical_alignment = (
-            WD_CELL_VERTICAL_ALIGNMENT.CENTER
-        )
-
-        for paragraph in cell.paragraphs:
-            paragraph.paragraph_format.space_after = Pt(0)
-            paragraph.paragraph_format.space_before = Pt(0)
-            paragraph.paragraph_format.line_spacing = 1.0
-
-            if centered:
-                paragraph.alignment = (
-                    WD_ALIGN_PARAGRAPH.CENTER
-                )
-
-    def word_table(self, document, rows, widths):
-        table = document.add_table(
-            rows=len(rows),
-            cols=len(widths),
-        )
-
-        table.style = "Table Grid"
-        table.autofit = False
-
-        for i, width in enumerate(widths):
-            table.columns[i].width = Cm(width)
-
-        for r, values in enumerate(rows):
-            for c, value in enumerate(values):
-                cell = table.cell(r, c)
-                cell.width = Cm(widths[c])
-                cell.text = str(value)
-                self.format_cell(cell)
-
-        return table
-
-    def create_word(self, data):
-        document = Document()
-
-        section = document.sections[0]
-
-        section.page_width = Cm(21)
-        section.page_height = Cm(29.7)
-
-        section.top_margin = Cm(1.5)
-        section.bottom_margin = Cm(1.5)
-        section.left_margin = Cm(1)
-        section.right_margin = Cm(1)
-
-        normal = document.styles["Normal"]
-
-        normal.font.name = "Arial"
-        normal.font.size = Pt(12)
-
-        normal.paragraph_format.space_after = Pt(0)
-        normal.paragraph_format.space_before = Pt(0)
-        normal.paragraph_format.line_spacing = 1.0
-
-        header = self.word_table(
-            document,
-            self.header_rows(data),
-            [5.5, 13.5],
-        )
-
-        for row in header.rows:
-            self.shade(row.cells[0])
-            self.format_cell(
-                row.cells[0],
-                centered=True,
+        if supplier_part:
+            supplier = str(
+                supplier_part.supplier.name
             )
 
-        articles = self.word_table(
-            document,
-            self.article_rows(data),
-            [1.7, 7, 3.9, 3.2, 3.2],
-        )
-
-        for cell in articles.rows[0].cells:
-            self.shade(cell)
-            self.format_cell(cell, centered=True)
-
-        for index in (0, 2, 3, 4):
-            self.format_cell(
-                articles.cell(1, index),
-                centered=True,
-            )
-
-        last = articles.rows[-1]
-
-        merged = last.cells[0].merge(last.cells[3])
-        merged.text = "Gesamtsumme:"
-
-        self.format_cell(merged, centered=True)
-
-        self.format_cell(
-            last.cells[4],
-            centered=True,
-        )
-
-        output = BytesIO()
-        document.save(output)
-
-        return output.getvalue()
-
-    # ==========================================
-    # OPTIONALER PDF-ANHANG
-    # ==========================================
-
-    def pdf_table(self, rows, widths, centered=None):
-        centered = centered or set()
-
-        normal = ParagraphStyle(
-            "NormalCell",
-            fontName="Helvetica",
-            fontSize=12,
-            leading=14,
-            spaceBefore=0,
-            spaceAfter=0,
-        )
-
-        center = ParagraphStyle(
-            "CenteredCell",
-            parent=normal,
-            alignment=1,
-        )
-
-        converted = []
-
-        for r, row in enumerate(rows):
-            converted_row = []
-
-            for c, value in enumerate(row):
-                style = (
-                    center
-                    if (r, c) in centered
-                    else normal
+            try:
+                price = supplier_part.get_price(
+                    quantity,
+                    multiples=False,
+                    currency="EUR",
                 )
 
-                converted_row.append(
-                    Paragraph(
-                        escape(str(value)).replace(
-                            "\n", "<br/>"
-                        ),
-                        style,
+                if price is not None:
+                    total_price = self.number(price)
+
+                    unit_price = (
+                        total_price
+                        / Decimal(quantity)
                     )
+
+            except Exception:
+                logger.exception(
+                    "Preisabfrage fehlgeschlagen: "
+                    "Artikel %s",
+                    part.pk,
                 )
 
-            converted.append(converted_row)
+        return supplier, unit_price, total_price
 
-        table = Table(
-            converted,
-            colWidths=widths,
-            spaceBefore=0,
-            spaceAfter=0,
+    # ==========================================
+    # E-MAIL VERSENDEN
+    # ==========================================
+
+    def send_notification(
+        self,
+        part,
+        stock,
+        minimum,
+        maximum,
+        quantity,
+        recipient,
+    ):
+        supplier, unit_price, total_price = (
+            self.get_supplier_price(
+                part,
+                quantity,
+            )
         )
 
-        table.setStyle(TableStyle([
-            (
-                "GRID",
-                (0, 0), (-1, -1),
-                0.6, colors.black,
+        data = {
+            "company": str(
+                self.get_setting("COMPANY") or ""
             ),
-            (
-                "VALIGN",
-                (0, 0), (-1, -1),
-                "MIDDLE",
+            "applicant": str(
+                self.get_setting("APPLICANT") or ""
             ),
-            ("TOPPADDING", (0, 0), (-1, -1), 5),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ]))
-
-        return table
-
-    def create_pdf(self, data):
-        output = BytesIO()
-
-        document = SimpleDocTemplate(
-            output,
-            pagesize=A4,
-            leftMargin=28.35,
-            rightMargin=28.35,
-            topMargin=42.52,
-            bottomMargin=42.52,
-        )
-
-        gray = colors.HexColor("#BFBFBF")
-
-        header_rows = self.header_rows(data)
-
-        header = self.pdf_table(
-            header_rows,
-            [153, 374],
-            centered={
-                (r, 0)
-                for r in range(len(header_rows))
-            },
-        )
-
-        header.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (0, -1), gray),
-        ]))
-
-        centered = {
-            (0, c) for c in range(5)
+            "name": str(part.name),
+            "ipn": str(part.IPN or ""),
+            "supplier": supplier,
+            "stock": self.fmt(stock),
+            "minimum": self.fmt(minimum),
+            "maximum": self.fmt(maximum),
+            "quantity": quantity,
+            "unit_price": self.money(unit_price),
+            "total_price": self.money(total_price),
         }
 
-        centered.update({
-            (1, 0),
-            (1, 2),
-            (1, 3),
-            (1, 4),
-            (2, 0),
-            (2, 4),
-        })
-
-        articles = self.pdf_table(
-            self.article_rows(data),
-            [47, 194, 108, 89, 89],
-            centered=centered,
+        subject = (
+            "[InvenTree] Bedarfsmeldung - "
+            + (data["ipn"] or data["name"])
         )
 
-        articles.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), gray),
-            ("SPAN", (0, -1), (3, -1)),
-        ]))
+        # Textversion für Programme ohne HTML
 
-        document.build([
-            header,
-            articles,
-        ])
+        message = "\n".join(
+            f"{label} {value}"
+            for label, value in self.header_rows(data)
+        )
 
-        return output.getvalue()
+        message += (
+            f"\nMenge: {quantity}"
+            f"\nBezeichnung: {data['name']}"
+            f"\nArtikel Nr.: {data['ipn']}"
+            f"\nLieferant: {supplier}"
+            f"\nPreis netto €/ME: {data['unit_price']}"
+            f"\nGesamtsumme: {data['total_price']}"
+        )
+
+        email = EmailMultiAlternatives(
+            subject=subject,
+            body=message,
+            to=[recipient],
+        )
+
+        # Formular direkt in der E-Mail.
+        # Keine Word- oder PDF-Anhänge.
+
+        email.attach_alternative(
+            self.create_html(data),
+            "text/html",
+        )
+
+        return email.send(
+            fail_silently=False
+        ) == 1
 
     # ==========================================
-    # BESTANDSPRÜFUNG UND E-MAIL-VERSAND
+    # MANUELLE BEDARFSRÜCKSETZUNG
     # ==========================================
 
-    def check_stock(self):
-        if not self.enabled("ENABLED"):
-            return
-
-        recipient = str(
-            self.get_setting("RECIPIENT") or ""
-        ).strip()
-
-        if not recipient:
-            return
-
-        validate_email(recipient)
-
+    def apply_reset(self):
         part_id = int(
-            self.get_setting("TEST_PART_ID") or 1
+            self.get_setting("RESET_PART_ID") or 0
         )
 
-        rounding = max(
-            1,
-            int(self.get_setting("ROUNDING") or 10)
+        token = int(
+            self.get_setting("RESET_TOKEN") or 0
         )
 
+        if part_id <= 0 or token <= 0:
+            return
+
+        with transaction.atomic():
+
+            part = (
+                Part.objects.select_for_update()
+                .filter(pk=part_id)
+                .first()
+            )
+
+            if part is None:
+                return
+
+            metadata = dict(part.metadata or {})
+
+            state = dict(
+                metadata.get(self.STATE_KEY) or {}
+            )
+
+            if token <= int(
+                state.get("reset_token") or 0
+            ):
+                return
+
+            state["pending"] = "0"
+
+            state["last_stock"] = str(
+                self.number(part.total_stock)
+            )
+
+            state["last_ordered"] = str(
+                self.number(part.on_order)
+            )
+
+            state["reset_token"] = token
+
+            metadata[self.STATE_KEY] = state
+
+            metadata.pop(
+                "bedarfsmeldung_test_sent",
+                None,
+            )
+
+            part.metadata = metadata
+
+            part.save(
+                update_fields=["metadata"]
+            )
+
+            logger.info(
+                "Bedarf zurückgesetzt: Artikel %s",
+                part_id,
+            )
+
+    # ==========================================
+    # EINZELNEN ARTIKEL ÜBERPRÜFEN
+    # ==========================================
+
+    def check_part(
+        self,
+        part_id,
+        recipient,
+        rounding,
+    ):
         with transaction.atomic():
 
             part = (
@@ -595,187 +523,251 @@ class BedarfsmeldungPlugin(
             stock = self.number(part.total_stock)
             minimum = self.number(part.minimum_stock)
             maximum = self.number(part.maximum_stock)
-            ordered = self.number(part.on_order)
+
+            ordered = max(
+                Decimal("0"),
+                self.number(part.on_order),
+            )
 
             metadata = dict(part.metadata or {})
-            key = "bedarfsmeldung_test_sent"
 
-            if stock >= minimum:
-                if metadata.pop(key, None):
-                    part.metadata = metadata
-                    part.save(update_fields=["metadata"])
+            state = dict(
+                metadata.get(self.STATE_KEY) or {}
+            )
 
-                return
+            previous_stock = self.number(
+                state.get("last_stock", stock)
+            )
 
-            if maximum <= 0 or maximum < minimum:
-                return
+            previous_ordered = self.number(
+                state.get("last_ordered", ordered)
+            )
+
+            pending = max(
+                Decimal("0"),
+                self.number(
+                    state.get("pending", 0)
+                ),
+            )
+
+            # Jede beobachtete Bestandserhöhung
+            # reduziert den gemeldeten Bedarf.
+
+            increase = max(
+                Decimal("0"),
+                stock - previous_stock,
+            )
+
+            pending = max(
+                Decimal("0"),
+                pending - increase,
+            )
 
             include_orders = self.enabled(
                 "INCLUDE_OPEN_ORDERS"
             )
 
-            considered = (
+            # Optional offene Bestellungen
+            # aus InvenTree berücksichtigen.
+
+            if include_orders:
+                new_orders = max(
+                    Decimal("0"),
+                    ordered - previous_ordered,
+                )
+
+                pending = max(
+                    Decimal("0"),
+                    pending - new_orders,
+                )
+
+            considered_orders = (
                 ordered
                 if include_orders
                 else Decimal("0")
             )
 
-            demand = maximum - stock - considered
-
-            if demand <= 0:
-                return
+            # Alte Testmeldungen übernehmen.
+            # Die damalige Menge ist unbekannt.
 
             if (
-                self.enabled("PREVENT_DUPLICATES")
-                and metadata.get(key)
-            ):
-                return
-
-            quantity = int(
-                (demand / Decimal(rounding))
-                .to_integral_value(
-                    rounding=ROUND_CEILING
+                not state
+                and metadata.get(
+                    "bedarfsmeldung_test_sent"
                 )
-                * rounding
+                and stock < minimum
+                and maximum >= minimum
+            ):
+                pending = max(
+                    pending,
+                    maximum
+                    - stock
+                    - considered_orders,
+                    Decimal("0"),
+                )
+
+            metadata.pop(
+                "bedarfsmeldung_test_sent",
+                None,
             )
 
-            supplier_part = part.default_supplier
-            supplier = "Nicht hinterlegt"
+            # Nur gültige Mindest- und
+            # Maximalbestände berücksichtigen.
 
-            unit_price = None
-            total_price = None
+            valid_limits = (
+                minimum > 0
+                and maximum >= minimum
+            )
 
-            if supplier_part:
-                supplier = str(
-                    supplier_part.supplier.name
+            if valid_limits and stock < minimum:
+
+                considered_pending = (
+                    pending
+                    if self.enabled(
+                        "PREVENT_DUPLICATES"
+                    )
+                    else Decimal("0")
                 )
 
-                try:
-                    price = supplier_part.get_price(
-                        quantity,
-                        multiples=False,
-                        currency="EUR",
+                demand = (
+                    maximum
+                    - stock
+                    - considered_orders
+                    - considered_pending
+                )
+
+                if demand > 0:
+
+                    # Bedarf auf die eingestellte
+                    # Bestellmenge aufrunden.
+
+                    quantity = int(
+                        (
+                            demand
+                            / Decimal(rounding)
+                        ).to_integral_value(
+                            rounding=ROUND_CEILING
+                        )
+                        * rounding
                     )
 
-                    if price is not None:
-                        total_price = self.number(price)
+                    logger.info(
+                        "Bedarf berechnet: "
+                        "Artikel=%s Bestand=%s "
+                        "Minimum=%s Maximum=%s "
+                        "Gemeldet=%s Bestellt=%s "
+                        "Bedarf=%s Menge=%s",
+                        part.pk,
+                        stock,
+                        minimum,
+                        maximum,
+                        pending,
+                        considered_orders,
+                        demand,
+                        quantity,
+                    )
 
-                        unit_price = (
-                            total_price
-                            / Decimal(quantity)
+                    sent = self.send_notification(
+                        part,
+                        stock,
+                        minimum,
+                        maximum,
+                        quantity,
+                        recipient,
+                    )
+
+                    # Nur erfolgreich versendete
+                    # Meldungen speichern.
+
+                    if sent:
+                        pending += Decimal(quantity)
+
+                        logger.info(
+                            "Bedarfsmeldung versendet: "
+                            "Artikel=%s Menge=%s "
+                            "Offener Bedarf=%s",
+                            part.pk,
+                            quantity,
+                            pending,
                         )
 
-                except Exception:
-                    logger.exception(
-                        "Bedarfsmeldung: Preisabfrage "
-                        "für Artikel %s fehlgeschlagen",
-                        part.pk,
-                    )
+            # Bedarf und letzten Bestand
+            # dauerhaft speichern.
 
-            data = {
-                "company": str(
-                    self.get_setting("COMPANY") or ""
-                ),
-                "applicant": str(
-                    self.get_setting("APPLICANT") or ""
-                ),
-                "name": str(part.name),
-                "ipn": str(part.IPN or ""),
-                "supplier": supplier,
-                "stock": self.fmt(stock),
-                "minimum": self.fmt(minimum),
-                "maximum": self.fmt(maximum),
-                "ordered": self.fmt(ordered),
-                "considered": self.fmt(considered),
-                "demand": self.fmt(demand),
-                "quantity": quantity,
-                "unit_price": self.money(unit_price),
-                "total_price": self.money(total_price),
-            }
+            state["pending"] = str(pending)
+            state["last_stock"] = str(stock)
+            state["last_ordered"] = str(ordered)
 
-            logger.info(
-                "Bedarfsmeldung 1.4.0: "
-                "Artikel=%s, Bestand=%s, "
-                "Minimum=%s, Maximum=%s, "
-                "Offene Bestellungen=%s, "
-                "Beruecksichtigen=%s, "
-                "Rundung=%s, Bedarf=%s, Menge=%s, "
-                "Gesamtpreis=%s",
-                part.pk,
-                stock,
-                minimum,
-                maximum,
-                ordered,
-                include_orders,
-                rounding,
-                demand,
-                quantity,
-                total_price,
-            )
+            metadata[self.STATE_KEY] = state
 
-            subject = (
-                "[InvenTree] Bedarfsmeldung - "
-                + (data["ipn"] or data["name"])
-            )
-
-            # Textversion für E-Mail-Programme ohne HTML
-            message = "\n".join(
-                f"{label} {value}"
-                for label, value in self.header_rows(data)
-            )
-
-            message += (
-                f"\nMenge: {quantity}"
-                f"\nBezeichnung: {data['name']}"
-                f"\nArtikel Nr.: {data['ipn']}"
-                f"\nLieferant: {supplier}"
-                f"\nPreis netto €/ME: {data['unit_price']}"
-                f"\nGesamtsumme: {data['total_price']}"
-            )
-
-            email = EmailMultiAlternatives(
-                subject=subject,
-                body=message,
-                to=[recipient],
-            )
-
-            # Firmenformular direkt in der E-Mail
-            email.attach_alternative(
-                self.create_html(data),
-                "text/html",
-            )
-
-            safe_ipn = "".join(
-                c if c.isalnum() or c in "-_" else "_"
-                for c in (
-                    data["ipn"] or str(part.pk)
-                )
-            )
-
-            filename = "Bedarfsmeldung_" + safe_ipn
-
-            # Anhänge nur bei aktivierter Einstellung
-            if self.enabled("ATTACH_WORD"):
-                email.attach(
-                    filename + ".docx",
-                    self.create_word(data),
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                )
-
-            if self.enabled("ATTACH_PDF"):
-                email.attach(
-                    filename + ".pdf",
-                    self.create_pdf(data),
-                    "application/pdf",
-                )
-
-            sent = email.send(
-                fail_silently=False
-            )
-
-            if sent == 1:
-                metadata[key] = True
+            if metadata != part.metadata:
                 part.metadata = metadata
+
                 part.save(
                     update_fields=["metadata"]
+                )
+
+    # ==========================================
+    # AUTOMATISCHE BESTANDSÜBERWACHUNG
+    # ==========================================
+
+    def check_stock(self):
+
+        if not self.enabled("ENABLED"):
+            return
+
+        recipient = str(
+            self.get_setting("RECIPIENT") or ""
+        ).strip()
+
+        if not recipient:
+            return
+
+        validate_email(recipient)
+
+        rounding = max(
+            1,
+            int(
+                self.get_setting("ROUNDING") or 10
+            ),
+        )
+
+        self.apply_reset()
+
+        # Alle aktiven Artikel auswählen.
+
+        parts = Part.objects.filter(
+            active=True
+        )
+
+        # Nur im Testmodus auf eine ID begrenzen.
+
+        if self.enabled("TEST_MODE"):
+            part_id = int(
+                self.get_setting("TEST_PART_ID") or 1
+            )
+
+            parts = parts.filter(pk=part_id)
+
+        part_ids = list(
+            parts.values_list("pk", flat=True)
+        )
+
+        # Jeder Artikel wird separat geprüft.
+        # Ein Fehler stoppt nicht alle Artikel.
+
+        for part_id in part_ids:
+
+            try:
+                self.check_part(
+                    part_id,
+                    recipient,
+                    rounding,
+                )
+
+            except Exception:
+                logger.exception(
+                    "Bedarfsmeldung: Fehler bei "
+                    "Artikel %s",
+                    part_id,
                 )
