@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inventree-bedarfsmeldung"
-version = "1.4.0"
+version = "2.0.0"
 description = "Automatische Bedarfsmeldung für InvenTree"
 requires-python = ">=3.10"
 
