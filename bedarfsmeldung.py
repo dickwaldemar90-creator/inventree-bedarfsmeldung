@@ -2,6 +2,7 @@
 from decimal import Decimal, ROUND_CEILING
 from io import BytesIO
 from xml.sax.saxutils import escape
+import logging
 
 from django.core.mail import EmailMultiAlternatives
 from django.core.validators import validate_email
@@ -28,6 +29,8 @@ from reportlab.platypus import (
     Paragraph,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class BedarfsmeldungPlugin(
     SettingsMixin, ScheduleMixin, InvenTreePlugin
@@ -35,8 +38,8 @@ class BedarfsmeldungPlugin(
     NAME = "Bedarfsmeldung"
     SLUG = "bedarfsmeldung"
     TITLE = "Automatische Bedarfsmeldung"
-    DESCRIPTION = "Bedarfsmeldungen mit Word und PDF"
-    VERSION = "1.3.0"
+    DESCRIPTION = "Bedarfsmeldung direkt als E-Mail-Formular"
+    VERSION = "1.4.0"
 
     SCHEDULED_TASKS = {
         "bestandspruefung": {
@@ -86,12 +89,14 @@ class BedarfsmeldungPlugin(
         },
         "ATTACH_PDF": {
             "name": "PDF anhängen",
-            "default": True,
+            "description": "Optionaler PDF-Anhang",
+            "default": False,
             "validator": bool,
         },
         "ATTACH_WORD": {
             "name": "Word-Datei anhängen",
-            "default": True,
+            "description": "Optionaler Word-Anhang",
+            "default": False,
             "validator": bool,
         },
     }
@@ -132,18 +137,6 @@ class BedarfsmeldungPlugin(
             f"Maximalbestand: {data['maximum']} Stück"
         )
 
-    def reason(self, data):
-        return (
-            "Mindestbestand unterschritten.\n"
-            f"Lagerbestand: {data['stock']} Stück\n"
-            f"Mindestbestand: {data['minimum']} Stück\n"
-            f"Maximalbestand: {data['maximum']} Stück\n"
-            f"Offene Bestellungen: {data['ordered']} Stück\n"
-            f"Berücksichtigt: {data['considered']} Stück\n"
-            f"Rechnerischer Bedarf: {data['demand']} Stück\n"
-            f"Bestellmenge: {data['quantity']} Stück"
-        )
-
     def header_rows(self, data):
         return [
             ["Firma:", data["company"]],
@@ -165,14 +158,16 @@ class BedarfsmeldungPlugin(
         return [
             [
                 "Menge",
-                "Bezeichnung/ArtNr.",
-                "Lieferant/Hersteller",
+                "Bezeichnung / Artikel Nr.",
+                "Lieferant / Hersteller",
                 "Preis netto €/ME",
                 "Preis total",
             ],
             [
                 str(data["quantity"]),
-                data["name"] + "\n" + data["ipn"],
+                data["name"]
+                + "\nArtikel Nr.: "
+                + data["ipn"],
                 data["supplier"],
                 data["unit_price"],
                 data["total_price"],
@@ -186,10 +181,143 @@ class BedarfsmeldungPlugin(
             ],
         ]
 
+    # ==========================================
+    # HTML-FORMULAR DIREKT IN DER E-MAIL
+    # ==========================================
+
+    def html_value(self, value):
+        if not value:
+            return "&nbsp;"
+
+        return escape(str(value)).replace(
+            "\n", "<br>"
+        )
+
+    def create_html(self, data):
+        table_style = (
+            "border-collapse:collapse;"
+            "table-layout:fixed;"
+            "width:100%;"
+            "font-family:Arial,Helvetica,sans-serif;"
+            "font-size:16px;"
+            "line-height:1.3;"
+            "color:#000000;"
+            "background-color:#ffffff;"
+            "margin:0;"
+            "border-spacing:0;"
+        )
+
+        cell_style = (
+            "border:1px solid #000000;"
+            "padding:7px;"
+            "vertical-align:middle;"
+            "overflow-wrap:break-word;"
+            "color:#000000;"
+        )
+
+        gray_style = (
+            cell_style
+            + "background-color:#BFBFBF;"
+            + "text-align:center;"
+        )
+
+        white_style = (
+            cell_style
+            + "background-color:#FFFFFF;"
+        )
+
+        html = (
+            '<div style="width:100%;'
+            'max-width:1000px;margin:0;padding:0;">'
+        )
+
+        html += (
+            '<table cellpadding="0" cellspacing="0"'
+            f' style="{table_style}">'
+        )
+
+        for label, value in self.header_rows(data):
+            html += (
+                "<tr>"
+                f'<td width="29%" style="{gray_style}">'
+                + self.html_value(label)
+                + "</td>"
+                f'<td width="71%" style="{white_style}">'
+                + self.html_value(value)
+                + "</td>"
+                "</tr>"
+            )
+
+        html += "</table>"
+
+        html += (
+            '<table cellpadding="0" cellspacing="0"'
+            f' style="{table_style}">'
+        )
+
+        rows = self.article_rows(data)
+
+        widths = [
+            "9%",
+            "37%",
+            "20%",
+            "17%",
+            "17%",
+        ]
+
+        html += "<tr>"
+
+        for index, label in enumerate(rows[0]):
+            html += (
+                f'<td width="{widths[index]}"'
+                f' style="{gray_style}">'
+                + self.html_value(label)
+                + "</td>"
+            )
+
+        html += "</tr><tr>"
+
+        for index, value in enumerate(rows[1]):
+            alignment = (
+                "left" if index == 1 else "center"
+            )
+
+            html += (
+                f'<td style="{white_style}'
+                f'text-align:{alignment};">'
+                + self.html_value(value)
+                + "</td>"
+            )
+
+        html += "</tr>"
+
+        html += (
+            "<tr>"
+            f'<td colspan="4" style="{white_style}'
+            'text-align:center;">'
+            "Gesamtsumme:"
+            "</td>"
+            f'<td style="{white_style}'
+            'text-align:center;">'
+            + self.html_value(data["total_price"])
+            + "</td>"
+            "</tr>"
+        )
+
+        html += "</table></div>"
+
+        return html
+
+    # ==========================================
+    # OPTIONALER WORD-ANHANG
+    # ==========================================
+
     def shade(self, cell):
         properties = cell._tc.get_or_add_tcPr()
+
         shading = OxmlElement("w:shd")
         shading.set(qn("w:fill"), "BFBFBF")
+
         properties.append(shading)
 
     def format_cell(self, cell, centered=False):
@@ -232,16 +360,20 @@ class BedarfsmeldungPlugin(
         document = Document()
 
         section = document.sections[0]
+
         section.page_width = Cm(21)
         section.page_height = Cm(29.7)
-        section.top_margin = Cm(2)
-        section.bottom_margin = Cm(2)
-        section.left_margin = Cm(1.5)
-        section.right_margin = Cm(1.5)
+
+        section.top_margin = Cm(1.5)
+        section.bottom_margin = Cm(1.5)
+        section.left_margin = Cm(1)
+        section.right_margin = Cm(1)
 
         normal = document.styles["Normal"]
+
         normal.font.name = "Arial"
-        normal.font.size = Pt(10)
+        normal.font.size = Pt(12)
+
         normal.paragraph_format.space_after = Pt(0)
         normal.paragraph_format.space_before = Pt(0)
         normal.paragraph_format.line_spacing = 1.0
@@ -249,7 +381,7 @@ class BedarfsmeldungPlugin(
         header = self.word_table(
             document,
             self.header_rows(data),
-            [5, 13],
+            [5.5, 13.5],
         )
 
         for row in header.rows:
@@ -259,11 +391,10 @@ class BedarfsmeldungPlugin(
                 centered=True,
             )
 
-        # Artikeltabelle ohne Leerabsatz
         articles = self.word_table(
             document,
             self.article_rows(data),
-            [2, 7.5, 3.5, 2.5, 2.5],
+            [1.7, 7, 3.9, 3.2, 3.2],
         )
 
         for cell in articles.rows[0].cells:
@@ -277,10 +408,12 @@ class BedarfsmeldungPlugin(
             )
 
         last = articles.rows[-1]
+
         merged = last.cells[0].merge(last.cells[3])
         merged.text = "Gesamtsumme:"
 
         self.format_cell(merged, centered=True)
+
         self.format_cell(
             last.cells[4],
             centered=True,
@@ -288,7 +421,12 @@ class BedarfsmeldungPlugin(
 
         output = BytesIO()
         document.save(output)
+
         return output.getvalue()
+
+    # ==========================================
+    # OPTIONALER PDF-ANHANG
+    # ==========================================
 
     def pdf_table(self, rows, widths, centered=None):
         centered = centered or set()
@@ -296,8 +434,8 @@ class BedarfsmeldungPlugin(
         normal = ParagraphStyle(
             "NormalCell",
             fontName="Helvetica",
-            fontSize=9,
-            leading=11,
+            fontSize=12,
+            leading=14,
             spaceBefore=0,
             spaceAfter=0,
         )
@@ -349,8 +487,8 @@ class BedarfsmeldungPlugin(
                 (0, 0), (-1, -1),
                 "MIDDLE",
             ),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
             ("LEFTPADDING", (0, 0), (-1, -1), 4),
             ("RIGHTPADDING", (0, 0), (-1, -1), 4),
         ]))
@@ -363,10 +501,10 @@ class BedarfsmeldungPlugin(
         document = SimpleDocTemplate(
             output,
             pagesize=A4,
-            leftMargin=42,
-            rightMargin=42,
-            topMargin=56,
-            bottomMargin=56,
+            leftMargin=28.35,
+            rightMargin=28.35,
+            topMargin=42.52,
+            bottomMargin=42.52,
         )
 
         gray = colors.HexColor("#BFBFBF")
@@ -375,7 +513,7 @@ class BedarfsmeldungPlugin(
 
         header = self.pdf_table(
             header_rows,
-            [142, 368],
+            [153, 374],
             centered={
                 (r, 0)
                 for r in range(len(header_rows))
@@ -401,7 +539,7 @@ class BedarfsmeldungPlugin(
 
         articles = self.pdf_table(
             self.article_rows(data),
-            [56.67, 212.50, 99.17, 70.83, 70.83],
+            [47, 194, 108, 89, 89],
             centered=centered,
         )
 
@@ -410,13 +548,16 @@ class BedarfsmeldungPlugin(
             ("SPAN", (0, -1), (3, -1)),
         ]))
 
-        # Keine Leerzeilen oder Abstandshalter
         document.build([
             header,
             articles,
         ])
 
         return output.getvalue()
+
+    # ==========================================
+    # BESTANDSPRÜFUNG UND E-MAIL-VERSAND
+    # ==========================================
 
     def check_stock(self):
         if not self.enabled("ENABLED"):
@@ -463,14 +604,19 @@ class BedarfsmeldungPlugin(
                 if metadata.pop(key, None):
                     part.metadata = metadata
                     part.save(update_fields=["metadata"])
+
                 return
 
             if maximum <= 0 or maximum < minimum:
                 return
 
+            include_orders = self.enabled(
+                "INCLUDE_OPEN_ORDERS"
+            )
+
             considered = (
                 ordered
-                if self.enabled("INCLUDE_OPEN_ORDERS")
+                if include_orders
                 else Decimal("0")
             )
 
@@ -487,7 +633,9 @@ class BedarfsmeldungPlugin(
 
             quantity = int(
                 (demand / Decimal(rounding))
-                .to_integral_value(rounding=ROUND_CEILING)
+                .to_integral_value(
+                    rounding=ROUND_CEILING
+                )
                 * rounding
             )
 
@@ -502,16 +650,26 @@ class BedarfsmeldungPlugin(
                     supplier_part.supplier.name
                 )
 
-                price = supplier_part.get_price(
-                    quantity,
-                    multiples=False,
-                    currency="EUR",
-                )
+                try:
+                    price = supplier_part.get_price(
+                        quantity,
+                        multiples=False,
+                        currency="EUR",
+                    )
 
-                if price is not None:
-                    total_price = self.number(price)
-                    unit_price = (
-                        total_price / Decimal(quantity)
+                    if price is not None:
+                        total_price = self.number(price)
+
+                        unit_price = (
+                            total_price
+                            / Decimal(quantity)
+                        )
+
+                except Exception:
+                    logger.exception(
+                        "Bedarfsmeldung: Preisabfrage "
+                        "für Artikel %s fehlgeschlagen",
+                        part.pk,
                     )
 
             data = {
@@ -535,23 +693,44 @@ class BedarfsmeldungPlugin(
                 "total_price": self.money(total_price),
             }
 
+            logger.info(
+                "Bedarfsmeldung 1.4.0: "
+                "Artikel=%s, Bestand=%s, "
+                "Minimum=%s, Maximum=%s, "
+                "Offene Bestellungen=%s, "
+                "Beruecksichtigen=%s, "
+                "Rundung=%s, Bedarf=%s, Menge=%s, "
+                "Gesamtpreis=%s",
+                part.pk,
+                stock,
+                minimum,
+                maximum,
+                ordered,
+                include_orders,
+                rounding,
+                demand,
+                quantity,
+                total_price,
+            )
+
             subject = (
                 "[InvenTree] Bedarfsmeldung - "
                 + (data["ipn"] or data["name"])
             )
 
-            message = (
-                "AUTOMATISCHE BEDARFSMELDUNG\n\n"
-                f"Artikel: {data['name']}\n"
-                f"Artikelnummer: {data['ipn']}\n"
-                f"Lieferant: {supplier}\n\n"
-                + self.reason(data)
-                + "\n\n"
-                f"Einzelpreis: {data['unit_price']}\n"
-                f"Gesamtpreis: {data['total_price']}\n\n"
-                "Bitte Bedarfsmeldung prüfen.\n"
-                "Kostenstelle manuell ergänzen.\n"
-                "Es wurde keine Bestellung ausgelöst."
+            # Textversion für E-Mail-Programme ohne HTML
+            message = "\n".join(
+                f"{label} {value}"
+                for label, value in self.header_rows(data)
+            )
+
+            message += (
+                f"\nMenge: {quantity}"
+                f"\nBezeichnung: {data['name']}"
+                f"\nArtikel Nr.: {data['ipn']}"
+                f"\nLieferant: {supplier}"
+                f"\nPreis netto €/ME: {data['unit_price']}"
+                f"\nGesamtsumme: {data['total_price']}"
             )
 
             email = EmailMultiAlternatives(
@@ -560,54 +739,22 @@ class BedarfsmeldungPlugin(
                 to=[recipient],
             )
 
-            html_rows = [
-                ("Artikelnummer", data["ipn"]),
-                ("Bezeichnung", data["name"]),
-                ("Lieferant", supplier),
-                ("Lagerbestand", data["stock"]),
-                ("Mindestbestand", data["minimum"]),
-                ("Maximalbestand", data["maximum"]),
-                ("Offene Bestellungen", data["ordered"]),
-                ("Berücksichtigt", data["considered"]),
-                ("Rechnerischer Bedarf", data["demand"]),
-                ("Bestellmenge", str(quantity)),
-                ("Einzelpreis", data["unit_price"]),
-                ("Gesamtpreis", data["total_price"]),
-            ]
-
-            html = (
-                '<h2>Automatische Bedarfsmeldung</h2>'
-                '<p>Der Mindestbestand wurde unterschritten.</p>'
-                '<table style="border-collapse:collapse;'
-                'font-family:Arial;font-size:14px;">'
+            # Firmenformular direkt in der E-Mail
+            email.attach_alternative(
+                self.create_html(data),
+                "text/html",
             )
-
-            for label, value in html_rows:
-                html += (
-                    '<tr><td style="background:#eeeeee;'
-                    'border:1px solid #888;padding:8px;">'
-                    + escape(label)
-                    + '</td><td style="border:1px solid #888;'
-                    'padding:8px;">'
-                    + escape(str(value))
-                    + "</td></tr>"
-                )
-
-            html += (
-                "</table>"
-                "<p>Bitte Bedarfsmeldung prüfen.</p>"
-                "<p>Es wurde keine Bestellung ausgelöst.</p>"
-            )
-
-            email.attach_alternative(html, "text/html")
 
             safe_ipn = "".join(
                 c if c.isalnum() or c in "-_" else "_"
-                for c in (data["ipn"] or str(part.pk))
+                for c in (
+                    data["ipn"] or str(part.pk)
+                )
             )
 
             filename = "Bedarfsmeldung_" + safe_ipn
 
+            # Anhänge nur bei aktivierter Einstellung
             if self.enabled("ATTACH_WORD"):
                 email.attach(
                     filename + ".docx",
@@ -622,9 +769,13 @@ class BedarfsmeldungPlugin(
                     "application/pdf",
                 )
 
-            sent = email.send(fail_silently=False)
+            sent = email.send(
+                fail_silently=False
+            )
 
             if sent == 1:
                 metadata[key] = True
                 part.metadata = metadata
-                part.save(update_fields=["metadata"])
+                part.save(
+                    update_fields=["metadata"]
+                )
