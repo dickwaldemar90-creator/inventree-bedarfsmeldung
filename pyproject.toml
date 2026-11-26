@@ -5,14 +5,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inventree-bedarfsmeldung"
-version = "2.0.0"
+version = "2.1.0"
 description = "Automatische Bedarfsmeldung für InvenTree"
 requires-python = ">=3.10"
-
-dependencies = [
-    "python-docx>=1.1.0",
-    "reportlab>=4.0"
-]
 
 [project.entry-points."inventree_plugins"]
 bedarfsmeldung = "bedarfsmeldung:BedarfsmeldungPlugin"
